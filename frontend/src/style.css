@@ -348,15 +348,27 @@ input {
   height: 190px;
 }
 
+.app-shell {
+  grid-template-columns: minmax(400px, 520px) minmax(0, 1fr);
+  height: 100vh;
+  height: 100dvh;
+  min-height: 0;
+}
+
 .preview-workspace {
-  overflow: auto;
-  padding: 32px clamp(30px, 4vw, 68px) 56px;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  padding: clamp(16px, 3vh, 32px) clamp(20px, 4vw, 68px) clamp(20px, 5vh, 56px);
   background:
     radial-gradient(circle at 76% 14%, rgba(51, 112, 255, 0.08), transparent 24%),
     #eef2f8;
 }
 
 .preview-header {
+  flex: 0 0 auto;
   width: min(100%, 760px);
   margin: 0 auto 24px;
 }
@@ -394,18 +406,31 @@ input {
 
 .paper-stage {
   display: flex;
+  flex: 1 1 auto;
+  align-items: center;
   justify-content: center;
+  min-width: 0;
+  min-height: 0;
+  container-type: size;
 }
 
 .a4-preview {
   display: grid;
+  flex: 0 0 auto;
   grid-template-columns: 1fr 1fr;
-  width: min(100%, 760px);
+  width: min(100%, 760px, calc(70.707vh - 140px));
   aspect-ratio: 210 / 297;
   overflow: hidden;
   background: #ffffff;
   border: 1px solid #e1e5ec;
   box-shadow: 0 22px 60px rgba(30, 44, 68, 0.18), 0 4px 12px rgba(30, 44, 68, 0.08);
+  container-type: inline-size;
+}
+
+@supports (width: 1cqh) {
+  .a4-preview {
+    width: min(760px, 100cqw, 70.707cqh);
+  }
 }
 
 .image-zone {
@@ -429,6 +454,20 @@ input {
 .image-zone + .image-zone {
   padding-top: 85px;
   border-left: 1px dashed #d9dfe8;
+}
+
+@supports (width: 1cqw) {
+  .image-zone {
+    padding: 3.158cqw;
+  }
+
+  .image-zone:first-child {
+    padding-bottom: 0;
+  }
+
+  .image-zone + .image-zone {
+    padding-top: 11.184cqw;
+  }
 }
 
 .image-zone:hover,
@@ -457,11 +496,21 @@ input {
 }
 
 .upload-placeholder {
+  position: absolute;
+  top: 120px;
+  right: 0;
+  left: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
   color: #8994a7;
   text-align: center;
+}
+
+@supports (top: 1cqw) {
+  .upload-placeholder {
+    top: 15.789cqw;
+  }
 }
 
 .upload-mark {
@@ -496,7 +545,7 @@ input {
 
 @media (max-width: 1100px) {
   .app-shell {
-    grid-template-columns: 430px minmax(560px, 1fr);
+    grid-template-columns: minmax(400px, 430px) minmax(0, 1fr);
   }
 
   .control-panel {
@@ -510,85 +559,25 @@ input {
     display: block;
     height: auto;
     min-height: 100vh;
+    min-height: 100dvh;
     overflow: visible;
   }
 
-  .control-panel,
-  .preview-workspace {
+  .control-panel {
     overflow: visible;
   }
 
   .preview-workspace {
-    padding: 30px 20px 48px;
-  }
-}
-
-@media print {
-  @page {
-    size: A4 portrait;
-    margin: 0;
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
+    overflow: hidden;
+    padding: clamp(14px, 3vh, 30px) 20px clamp(16px, 4vh, 48px);
   }
 
-  html,
-  body {
-    width: 210mm !important;
-    height: 297mm !important;
-    margin: 0 !important;
-    padding: 0 !important;
-    overflow: hidden !important;
-    background: #ffffff !important;
-  }
-
-  #app,
-  .app-shell,
-  .preview-workspace,
-  .paper-stage {
-    width: 210mm !important;
-    height: 297mm !important;
-    min-height: 0 !important;
-    margin: 0 !important;
-    padding: 0 !important;
-    overflow: hidden !important;
-  }
-
-  .app-shell,
-  .preview-workspace,
-  .paper-stage {
-    display: block !important;
-  }
-
-  .control-panel,
   .preview-header {
-    display: none !important;
-  }
-
-  .preview-workspace {
-    background: #ffffff !important;
-  }
-
-  .a4-preview {
-    position: relative !important;
-    top: auto !important;
-    left: auto !important;
-    display: grid !important;
-    width: 210mm !important;
-    height: 297mm !important;
-    aspect-ratio: auto !important;
-    border: 0 !important;
-    box-shadow: none !important;
-    break-after: avoid-page;
-    break-inside: avoid-page;
-    page-break-after: avoid;
-    page-break-inside: avoid;
-    print-color-adjust: exact;
-    -webkit-print-color-adjust: exact;
-  }
-
-  .image-zone {
-    padding: 7mm;
-  }
-
-  .image-zone + .image-zone {
-    border-left-color: transparent !important;
+    flex-wrap: wrap;
+    gap: 10px 14px;
+    margin-bottom: 16px;
   }
 }

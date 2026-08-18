@@ -202,6 +202,7 @@ const loading = ref(false)
 const saving = ref(false)
 const downloading = ref(false)
 let chartInstance = null
+let releasePrintResource = null
 
 const toLocalISODate = (date = new Date()) => {
   const year = date.getFullYear()
@@ -345,43 +346,206 @@ const ensureImagesReady = () => {
   return true
 }
 
-const printPreview = () => {
+const waitForPreviewImages = async () => {
+  const expectedSources = [stubImage.value, receiptImage.value]
+  await nextTick()
+  const previewElement = document.querySelector('.a4-preview')
+  const previewImages = Array.from(previewElement?.querySelectorAll('img') ?? [])
+
+  if (!previewElement || previewImages.length !== 2) {
+    throw new Error('预览图片尚未挂载')
+  }
+
+  await Promise.all(
+    previewImages.map(async (image) => {
+      if (typeof image.decode === 'function') {
+        try {
+          await image.decode()
+        } catch (error) {
+          if (!image.complete || image.naturalWidth === 0) throw error
+        }
+      } else if (!image.complete) {
+        await new Promise((resolve, reject) => {
+          image.addEventListener('load', resolve, { once: true })
+          image.addEventListener('error', reject, { once: true })
+        })
+      }
+
+      if (image.naturalWidth === 0 || image.naturalHeight === 0) {
+        throw new Error('预览图片加载失败')
+      }
+    })
+  )
+
+  await new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve))
+  })
+  await nextTick()
+
+  const currentImages = Array.from(previewElement.querySelectorAll('img'))
+  const sourcesChanged = expectedSources[0] !== stubImage.value || expectedSources[1] !== receiptImage.value
+  const elementsChanged = currentImages.length !== 2 || currentImages.some((image, index) => image !== previewImages[index])
+  if (sourcesChanged || elementsChanged) {
+    throw new Error('预览图片已发生变化')
+  }
+
+  return previewElement
+}
+
+const renderPreviewCanvas = async ({ scale = 2, targetWidth = 0, removePaperBorder = false } = {}) => {
+  const previewElement = await waitForPreviewImages()
+  const previewWidth = Math.max(previewElement.getBoundingClientRect().width, 1)
+  const renderScale = targetWidth > 0 ? Math.max(scale, targetWidth / previewWidth) : scale
+
+  return html2canvas(previewElement, {
+    scale: renderScale,
+    useCORS: true,
+    backgroundColor: '#ffffff',
+    logging: false,
+    onclone: (clonedDocument) => {
+      const preview = clonedDocument.querySelector('.a4-preview')
+      const zones = preview?.querySelectorAll('.image-zone') ?? []
+
+      if (removePaperBorder) {
+        preview?.style.setProperty('border-color', 'transparent', 'important')
+        preview?.style.setProperty('box-shadow', 'none', 'important')
+      }
+
+      zones.forEach((zone) => {
+        zone.classList.remove('image-zone--dragging')
+        zone.style.setProperty('background', '#ffffff', 'important')
+        zone.style.setProperty('box-shadow', 'none', 'important')
+        zone.style.setProperty('outline', 'none', 'important')
+      })
+
+      const divider = preview?.querySelector('.image-zone + .image-zone')
+      divider?.style.setProperty('border-left-color', 'transparent', 'important')
+    }
+  })
+}
+
+const canvasToPngBlob = (canvas) =>
+  new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob)
+      else reject(new Error('打印图片生成失败'))
+    }, 'image/png')
+  })
+
+const waitForImageElement = async (image) => {
+  if (typeof image.decode === 'function') {
+    try {
+      await image.decode()
+    } catch (error) {
+      if (!image.complete || image.naturalWidth === 0) throw error
+    }
+  } else if (!image.complete) {
+    await new Promise((resolve, reject) => {
+      image.addEventListener('load', resolve, { once: true })
+      image.addEventListener('error', reject, { once: true })
+    })
+  }
+
+  if (image.naturalWidth === 0 || image.naturalHeight === 0) {
+    throw new Error('打印图片加载失败')
+  }
+}
+
+const printPreview = async () => {
   if (!ensureImagesReady()) return
-  window.print()
+
+  releasePrintResource?.()
+  releasePrintResource = null
+
+  let printFrame = null
+  let printImageUrl = null
+  let cleaned = false
+  const cleanup = () => {
+    if (cleaned) return
+    cleaned = true
+    printFrame?.remove()
+    if (printImageUrl) URL.revokeObjectURL(printImageUrl)
+    if (releasePrintResource === cleanup) releasePrintResource = null
+  }
+
+  try {
+    const canvas = await renderPreviewCanvas({ targetWidth: 2480, removePaperBorder: true })
+    const printBlob = await canvasToPngBlob(canvas)
+    printImageUrl = URL.createObjectURL(printBlob)
+
+    printFrame = document.createElement('iframe')
+    printFrame.setAttribute('aria-hidden', 'true')
+    printFrame.style.cssText = 'position:fixed;left:-10000px;top:0;width:1px;height:1px;border:0;'
+    document.body.appendChild(printFrame)
+
+    const frameWindow = printFrame.contentWindow
+    const frameDocument = printFrame.contentDocument
+    if (!frameWindow || !frameDocument) throw new Error('打印窗口创建失败')
+
+    frameDocument.open()
+    frameDocument.write(`<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>打印小票</title>
+  <style>
+    @page { size: A4 portrait; margin: 0; }
+    * { box-sizing: border-box; }
+    html, body {
+      width: 209mm;
+      height: 296mm;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #ffffff;
+    }
+    .print-sheet {
+      width: 209mm;
+      height: 296mm;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      break-inside: avoid;
+      page-break-inside: avoid;
+    }
+    #print-image {
+      display: block;
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      object-fit: contain;
+    }
+  </style>
+</head>
+<body>
+  <div class="print-sheet"><img id="print-image" alt="小票打印内容" /></div>
+</body>
+</html>`)
+    frameDocument.close()
+
+    const printImage = frameDocument.querySelector('#print-image')
+    if (!printImage) throw new Error('打印图片节点创建失败')
+    printImage.src = printImageUrl
+    await waitForImageElement(printImage)
+    await new Promise((resolve) => {
+      frameWindow.requestAnimationFrame(() => frameWindow.requestAnimationFrame(resolve))
+    })
+
+    releasePrintResource = cleanup
+    frameWindow.focus()
+    frameWindow.print()
+  } catch (error) {
+    cleanup()
+    console.error(error)
+    ElMessage.error('打印内容生成失败，请稍后重试')
+  }
 }
 
 const downloadCombined = async () => {
   if (!ensureImagesReady()) return
   downloading.value = true
   try {
-    await nextTick()
-    const previewElement = document.querySelector('.a4-preview')
-    const previewImages = Array.from(previewElement.querySelectorAll('img'))
-
-    await Promise.all(
-      previewImages.map(async (image) => {
-        if (image.complete && image.naturalWidth > 0) return
-        if (typeof image.decode === 'function') {
-          await image.decode()
-          return
-        }
-        await new Promise((resolve, reject) => {
-          image.addEventListener('load', resolve, { once: true })
-          image.addEventListener('error', reject, { once: true })
-        })
-      })
-    )
-
-    const canvas = await html2canvas(previewElement, {
-      scale: 2,
-      useCORS: true,
-      backgroundColor: '#ffffff',
-      logging: false,
-      onclone: (clonedDocument) => {
-        const divider = clonedDocument.querySelector('.a4-preview .image-zone + .image-zone')
-        divider?.style.setProperty('border-left-color', 'transparent', 'important')
-      }
-    })
+    const canvas = await renderPreviewCanvas({ targetWidth: 2480 })
     const link = document.createElement('a')
     link.download = `小票组合_${today}.png`
     link.href = canvas.toDataURL('image/png')
@@ -460,6 +624,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', resizeChart)
+  releasePrintResource?.()
   chartInstance?.dispose()
 })
 </script>
