@@ -5,7 +5,9 @@
   "description": "门店小票打印助手后端服务",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "build:frontend": "npm --prefix ../frontend run build",
+    "deploy": "npm run build:frontend && node server.js"
   },
   "engines": {
     "node": ">=16.17.1"

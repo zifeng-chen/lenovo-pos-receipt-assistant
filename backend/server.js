@@ -5,8 +5,11 @@ const fs = require('fs')
 const path = require('path')
 
 const app = express()
-const port = Number(process.env.PORT) || 3000
+const port = Number(process.env.PORT) || 8889
+const host = process.env.HOST || '0.0.0.0'
 const databasePath = path.join(__dirname, 'db', 'database.sqlite')
+const frontendDistPath = path.join(__dirname, '..', 'frontend', 'dist')
+const frontendIndexPath = path.join(frontendDistPath, 'index.html')
 
 fs.mkdirSync(path.dirname(databasePath), { recursive: true })
 
@@ -127,14 +130,23 @@ app.put('/api/sales/:id/toggle', (req, res) => {
   return res.json(getSaleById(id))
 })
 
+if (fs.existsSync(frontendIndexPath)) {
+  app.use(express.static(frontendDistPath))
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api/')) return next()
+    return res.sendFile(frontendIndexPath)
+  })
+}
+
 app.use((error, req, res, next) => {
   console.error(error)
   if (res.headersSent) return next(error)
   return res.status(500).json({ message: '服务器内部错误' })
 })
 
-const server = app.listen(port, '127.0.0.1', () => {
-  console.log(`门店小票打印助手后端已启动：http://localhost:${port}`)
+const server = app.listen(port, host, () => {
+  console.log(`门店小票打印助手已启动：http://localhost:${port}`)
+  console.log(`局域网访问：http://<本机局域网IP>:${port}`)
 })
 
 function shutdown() {
