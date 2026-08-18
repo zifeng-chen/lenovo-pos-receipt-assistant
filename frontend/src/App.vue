@@ -356,11 +356,31 @@ const downloadCombined = async () => {
   try {
     await nextTick()
     const previewElement = document.querySelector('.a4-preview')
+    const previewImages = Array.from(previewElement.querySelectorAll('img'))
+
+    await Promise.all(
+      previewImages.map(async (image) => {
+        if (image.complete && image.naturalWidth > 0) return
+        if (typeof image.decode === 'function') {
+          await image.decode()
+          return
+        }
+        await new Promise((resolve, reject) => {
+          image.addEventListener('load', resolve, { once: true })
+          image.addEventListener('error', reject, { once: true })
+        })
+      })
+    )
+
     const canvas = await html2canvas(previewElement, {
       scale: 2,
       useCORS: true,
       backgroundColor: '#ffffff',
-      logging: false
+      logging: false,
+      onclone: (clonedDocument) => {
+        const divider = clonedDocument.querySelector('.a4-preview .image-zone + .image-zone')
+        divider?.style.setProperty('border-left-color', 'transparent', 'important')
+      }
     })
     const link = document.createElement('a')
     link.download = `小票组合_${today}.png`
