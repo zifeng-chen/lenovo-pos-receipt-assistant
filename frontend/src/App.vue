@@ -394,8 +394,31 @@ const waitForPreviewImages = async () => {
 
 const renderPreviewCanvas = async ({ scale = 2, targetWidth = 0, removePaperBorder = false } = {}) => {
   const previewElement = await waitForPreviewImages()
-  const previewWidth = Math.max(previewElement.getBoundingClientRect().width, 1)
+  const previewRect = previewElement.getBoundingClientRect()
+  const previewWidth = Math.max(previewRect.width, 1)
   const renderScale = targetWidth > 0 ? Math.max(scale, targetWidth / previewWidth) : scale
+  const imageLayouts = Array.from(previewElement.querySelectorAll('.image-zone')).map((zone, index) => {
+    const image = zone.querySelector('img')
+    if (!image) throw new Error('预览图片节点缺失')
+
+    const imageRect = image.getBoundingClientRect()
+    const zoneRect = zone.getBoundingClientRect()
+    const zoneStyle = window.getComputedStyle(zone)
+    const borderLeft = Number.parseFloat(zoneStyle.borderLeftWidth) || 0
+    const borderTop = Number.parseFloat(zoneStyle.borderTopWidth) || 0
+    const containScale = Math.min(imageRect.width / image.naturalWidth, imageRect.height / image.naturalHeight)
+    const width = image.naturalWidth * containScale
+    const height = image.naturalHeight * containScale
+    const paintedLeft = imageRect.left + (imageRect.width - width) / 2
+    const paintedTop = index === 0 ? imageRect.bottom - height : imageRect.top
+
+    return {
+      left: paintedLeft - zoneRect.left - borderLeft,
+      top: paintedTop - zoneRect.top - borderTop,
+      width,
+      height
+    }
+  })
 
   return html2canvas(previewElement, {
     scale: renderScale,
@@ -404,18 +427,41 @@ const renderPreviewCanvas = async ({ scale = 2, targetWidth = 0, removePaperBord
     logging: false,
     onclone: (clonedDocument) => {
       const preview = clonedDocument.querySelector('.a4-preview')
-      const zones = preview?.querySelectorAll('.image-zone') ?? []
+      const zones = Array.from(preview?.querySelectorAll('.image-zone') ?? [])
+
+      preview?.style.setProperty('width', `${previewRect.width}px`, 'important')
+      preview?.style.setProperty('height', `${previewRect.height}px`, 'important')
+      preview?.style.setProperty('aspect-ratio', 'auto', 'important')
 
       if (removePaperBorder) {
         preview?.style.setProperty('border-color', 'transparent', 'important')
         preview?.style.setProperty('box-shadow', 'none', 'important')
       }
 
-      zones.forEach((zone) => {
+      zones.forEach((zone, index) => {
+        const image = zone.querySelector('img')
+        const layout = imageLayouts[index]
+
         zone.classList.remove('image-zone--dragging')
+        zone.style.setProperty('position', 'relative', 'important')
         zone.style.setProperty('background', '#ffffff', 'important')
         zone.style.setProperty('box-shadow', 'none', 'important')
         zone.style.setProperty('outline', 'none', 'important')
+
+        if (!image || !layout) return
+        image.style.setProperty('position', 'absolute', 'important')
+        image.style.setProperty('left', `${layout.left}px`, 'important')
+        image.style.setProperty('top', `${layout.top}px`, 'important')
+        image.style.setProperty('width', `${layout.width}px`, 'important')
+        image.style.setProperty('height', `${layout.height}px`, 'important')
+        image.style.setProperty('min-width', '0', 'important')
+        image.style.setProperty('min-height', '0', 'important')
+        image.style.setProperty('max-width', 'none', 'important')
+        image.style.setProperty('max-height', 'none', 'important')
+        image.style.setProperty('margin', '0', 'important')
+        image.style.setProperty('object-fit', 'fill', 'important')
+        image.style.setProperty('object-position', '50% 50%', 'important')
+        image.style.setProperty('transform', 'none', 'important')
       })
 
       const divider = preview?.querySelector('.image-zone + .image-zone')
