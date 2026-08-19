@@ -3,6 +3,10 @@ const cors = require('cors')
 const Database = require('better-sqlite3')
 const fs = require('fs')
 const path = require('path')
+const { loadLocalEnv } = require('./local-env')
+const { createBaiduOcrService } = require('./baidu-ocr')
+
+loadLocalEnv(path.join(__dirname, '.env'))
 
 const app = express()
 const port = Number(process.env.PORT) || 8889
@@ -10,6 +14,11 @@ const host = process.env.HOST || '0.0.0.0'
 const databasePath = path.join(__dirname, 'db', 'database.sqlite')
 const frontendDistPath = path.join(__dirname, '..', 'frontend', 'dist')
 const frontendIndexPath = path.join(frontendDistPath, 'index.html')
+const baiduOcr = createBaiduOcrService({
+  apiKey: process.env.BAIDU_OCR_API_KEY,
+  secretKey: process.env.BAIDU_OCR_SECRET_KEY,
+  endpoint: process.env.BAIDU_OCR_ENDPOINT
+})
 
 fs.mkdirSync(path.dirname(databasePath), { recursive: true })
 
@@ -43,6 +52,174 @@ function toLocalISODate(date = new Date()) {
 function getSaleById(id) {
   return db.prepare('SELECT * FROM sales WHERE id = ?').get(id)
 }
+
+const ocrRequestHistory = new Map()
+const OCR_DEADLINE_MS = 35000
+let activeOcrRequests = 0
+
+function createOcrRequestError(status, message, code) {
+  const error = new Error(message)
+  error.status = status
+  error.code = code
+  return error
+}
+
+function ocrRateLimit(req, res, next) {
+  const now = Date.now()
+  const windowStart = now - 60 * 1000
+  const requestKey = req.ip || req.socket.remoteAddress || 'unknown'
+  const recentRequests = (ocrRequestHistory.get(requestKey) || []).filter((timestamp) => timestamp > windowStart)
+
+  if (recentRequests.length >= 10) {
+    return res.status(429).json({ message: '文字识别请求过于频繁，请稍后重试' })
+  }
+  if (activeOcrRequests >= 2) {
+    return res.status(429).json({ message: '文字识别服务繁忙，请稍后重试' })
+  }
+
+  recentRequests.push(now)
+  ocrRequestHistory.set(requestKey, recentRequests)
+  activeOcrRequests += 1
+
+  const controller = new AbortController()
+  let processing = false
+  let released = false
+  const abort = (error) => {
+    if (!controller.signal.aborted) controller.abort(error)
+  }
+  const handleRequestAborted = () => {
+    abort(createOcrRequestError(499, '客户端已取消文字识别请求', 'OCR_CLIENT_ABORTED'))
+  }
+  const handleResponseClose = () => {
+    if (!res.writableEnded) handleRequestAborted()
+    if (!processing) release()
+  }
+  const handleResponseFinish = () => {
+    if (!processing) release()
+  }
+  const timeout = setTimeout(() => {
+    abort(createOcrRequestError(504, '文字识别请求超过 35 秒', 'OCR_DEADLINE_EXCEEDED'))
+  }, OCR_DEADLINE_MS)
+  const release = () => {
+    if (released) return
+    released = true
+    clearTimeout(timeout)
+    req.removeListener('aborted', handleRequestAborted)
+    res.removeListener('close', handleResponseClose)
+    res.removeListener('finish', handleResponseFinish)
+    activeOcrRequests = Math.max(0, activeOcrRequests - 1)
+  }
+
+  req.once('aborted', handleRequestAborted)
+  res.once('close', handleResponseClose)
+  res.once('finish', handleResponseFinish)
+  res.locals.ocrRequest = {
+    signal: controller.signal,
+    startProcessing() {
+      processing = true
+    },
+    release
+  }
+  return next()
+}
+
+function isSupportedOcrImage(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 4) return false
+  const isPng = buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+  const isJpeg = buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[buffer.length - 2] === 0xff && buffer[buffer.length - 1] === 0xd9
+  return isPng || isJpeg
+}
+
+function parseOcrImage(req, res, next) {
+  if (!req.is(['image/png', 'image/jpeg'])) {
+    req.body = undefined
+    return next()
+  }
+
+  const ocrRequest = res.locals.ocrRequest
+  const chunks = []
+  const maxBytes = 6 * 1024 * 1024
+  let size = 0
+  let completed = false
+
+  const cleanup = () => {
+    req.removeListener('data', handleData)
+    req.removeListener('end', handleEnd)
+    req.removeListener('error', handleError)
+    ocrRequest.signal.removeEventListener('abort', handleAbort)
+  }
+  const complete = (callback) => {
+    if (completed) return
+    completed = true
+    cleanup()
+    callback()
+  }
+  const stopReading = () => {
+    cleanup()
+    req.resume()
+  }
+  const handleData = (chunk) => {
+    size += chunk.length
+    if (size > maxBytes) {
+      complete(() => {
+        stopReading()
+        next(createOcrRequestError(413, '提交的图片过大，请压缩后重试', 'OCR_IMAGE_TOO_LARGE'))
+      })
+      return
+    }
+    chunks.push(chunk)
+  }
+  const handleEnd = () => {
+    complete(() => {
+      req.body = Buffer.concat(chunks)
+      next()
+    })
+  }
+  const handleError = (error) => {
+    complete(() => next(error))
+  }
+  const handleAbort = () => {
+    complete(() => {
+      stopReading()
+      const error = ocrRequest.signal.reason || createOcrRequestError(499, '文字识别请求已取消', 'OCR_REQUEST_ABORTED')
+      ocrRequest.release()
+      if (error.status === 504 && !res.headersSent && !res.writableEnded) {
+        res.status(504).json({ message: error.message })
+      }
+    })
+  }
+
+  if (ocrRequest.signal.aborted) {
+    handleAbort()
+    return
+  }
+  req.on('data', handleData)
+  req.once('end', handleEnd)
+  req.once('error', handleError)
+  ocrRequest.signal.addEventListener('abort', handleAbort, { once: true })
+}
+
+app.post(
+  '/api/ocr/amount',
+  ocrRateLimit,
+  parseOcrImage,
+  async (req, res, next) => {
+    if (!isSupportedOcrImage(req.body)) {
+      return res.status(400).json({ message: '请提交有效的 PNG 或 JPEG 合成图片' })
+    }
+
+    const ocrRequest = res.locals.ocrRequest
+    ocrRequest.startProcessing()
+    try {
+      const result = await baiduOcr.recognizeAmount(req.body, { signal: ocrRequest.signal })
+      return res.json(result)
+    } catch (error) {
+      return next(error)
+    } finally {
+      ocrRequest.release()
+    }
+  }
+)
 
 app.post('/api/sales', (req, res) => {
   const amount = Number(req.body?.amount)
@@ -139,8 +316,19 @@ if (fs.existsSync(frontendIndexPath)) {
 }
 
 app.use((error, req, res, next) => {
-  console.error(error)
   if (res.headersSent) return next(error)
+
+  if (error.type === 'entity.too.large') {
+    return res.status(413).json({ message: '提交的图片过大，请压缩后重试' })
+  }
+
+  const status = Number(error.status)
+  if (Number.isInteger(status) && status >= 400 && status < 600) {
+    if (status >= 500) console.error(`OCR/API 错误 [${error.code || status}]：${error.message}`)
+    return res.status(status).json({ message: error.message })
+  }
+
+  console.error(error)
   return res.status(500).json({ message: '服务器内部错误' })
 })
 

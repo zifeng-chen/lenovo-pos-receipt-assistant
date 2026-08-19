@@ -45,11 +45,16 @@
             :controls="false"
             placeholder="0.00"
             class="amount-input"
+            @input="markSaleAmountEdited"
             @keyup.enter="saveSale"
           />
           <el-button type="primary" :loading="saving" class="save-button" @click="saveSale">
             保存记录
           </el-button>
+        </div>
+        <div :class="['ocr-hint', `ocr-hint--${ocrMessageType}`]" aria-live="polite">
+          <span v-if="recognizing" class="ocr-spinner" aria-hidden="true"></span>
+          {{ ocrMessage }}
         </div>
       </section>
 
@@ -201,17 +206,41 @@ const draggingSide = ref(null)
 const loading = ref(false)
 const saving = ref(false)
 const downloading = ref(false)
+const recognizing = ref(false)
+const ocrMessage = ref('上传两张图片后自动识别销售金额')
+const ocrMessageType = ref('neutral')
 let chartInstance = null
 let releasePrintResource = null
+let ocrAbortController = null
+let ocrRequestId = 0
+let saleAmountEditVersion = 0
+let saleAmountManuallyEdited = false
+const imageReadVersions = { stub: 0, receipt: 0 }
 
-const toLocalISODate = (date = new Date()) => {
-  const year = date.getFullYear()
-  const month = String(date.getMonth() + 1).padStart(2, '0')
-  const day = String(date.getDate()).padStart(2, '0')
-  return `${year}-${month}-${day}`
+const markSaleAmountEdited = () => {
+  saleAmountManuallyEdited = true
+  saleAmountEditVersion += 1
 }
 
-const today = toLocalISODate()
+const cancelActiveOcr = () => {
+  ocrRequestId += 1
+  ocrAbortController?.abort()
+  ocrAbortController = null
+  recognizing.value = false
+}
+
+const formatReceiptTimestamp = (date = new Date()) => {
+  const parts = [
+    date.getFullYear(),
+    date.getMonth() + 1,
+    date.getDate(),
+    date.getHours(),
+    date.getMinutes(),
+    date.getSeconds()
+  ]
+  return parts.map((part, index) => (index === 0 ? String(part) : String(part).padStart(2, '0'))).join('')
+}
+
 const displayToday = new Intl.DateTimeFormat('zh-CN', {
   month: 'long',
   day: 'numeric',
@@ -258,6 +287,7 @@ const saveSale = async () => {
   try {
     await api.post('/sales', { amount })
     saleAmount.value = null
+    saleAmountManuallyEdited = false
     ElMessage.success('销售记录已保存')
   } catch (error) {
     ElMessage.error(errorMessage(error, '保存失败，请检查后端服务'))
@@ -309,12 +339,24 @@ const readImage = (side, file) => {
     return
   }
 
+  cancelActiveOcr()
+  const readVersion = ++imageReadVersions[side]
+  ocrMessage.value = '正在读取图片...'
+  ocrMessageType.value = 'loading'
+
   const reader = new FileReader()
   reader.onload = (event) => {
+    if (readVersion !== imageReadVersions[side]) return
     if (side === 'stub') stubImage.value = event.target.result
     else receiptImage.value = event.target.result
+    void nextTick().then(() => recognizeAmountAutomatically())
   }
-  reader.onerror = () => ElMessage.error('图片读取失败，请重新选择')
+  reader.onerror = () => {
+    if (readVersion !== imageReadVersions[side]) return
+    ocrMessage.value = '图片读取失败，请重新选择'
+    ocrMessageType.value = 'error'
+    ElMessage.error('图片读取失败，请重新选择')
+  }
   reader.readAsDataURL(file)
 }
 
@@ -329,7 +371,14 @@ const handleFileSelect = (side, event) => {
 }
 
 const clearImages = () => {
-  if (!stubImage.value && !receiptImage.value) {
+  const hadImages = Boolean(stubImage.value || receiptImage.value)
+  imageReadVersions.stub += 1
+  imageReadVersions.receipt += 1
+  cancelActiveOcr()
+  ocrMessage.value = '上传两张图片后自动识别销售金额'
+  ocrMessageType.value = 'neutral'
+
+  if (!hadImages) {
     ElMessage.info('预览区暂无图片')
     return
   }
@@ -470,13 +519,78 @@ const renderPreviewCanvas = async ({ scale = 2, targetWidth = 0, removePaperBord
   })
 }
 
-const canvasToPngBlob = (canvas) =>
+const canvasToBlob = (canvas, type = 'image/png', quality) =>
   new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (blob) resolve(blob)
-      else reject(new Error('打印图片生成失败'))
-    }, 'image/png')
+    canvas.toBlob(
+      (blob) => {
+        if (blob) resolve(blob)
+        else reject(new Error('组合图片生成失败'))
+      },
+      type,
+      quality
+    )
   })
+
+const canvasToPngBlob = (canvas) => canvasToBlob(canvas, 'image/png')
+
+const recognizeAmountAutomatically = async () => {
+  const requestId = ++ocrRequestId
+  ocrAbortController?.abort()
+  ocrAbortController = null
+
+  if (!stubImage.value || !receiptImage.value) {
+    recognizing.value = false
+    ocrMessage.value = '请继续上传另一张图片，上传完成后将自动识别金额'
+    ocrMessageType.value = 'neutral'
+    return
+  }
+
+  const controller = new AbortController()
+  const editVersionAtStart = saleAmountEditVersion
+  const manuallyEditedAtStart = saleAmountManuallyEdited
+  ocrAbortController = controller
+  recognizing.value = true
+  ocrMessage.value = '正在合成票据并识别金额...'
+  ocrMessageType.value = 'loading'
+
+  try {
+    const canvas = await renderPreviewCanvas({ targetWidth: 1600, removePaperBorder: true })
+    if (requestId !== ocrRequestId) return
+
+    const imageBlob = await canvasToBlob(canvas, 'image/jpeg', 0.88)
+    const { data } = await api.post('/ocr/amount', imageBlob, {
+      headers: { 'Content-Type': 'image/jpeg' },
+      timeout: 45000,
+      signal: controller.signal
+    })
+    if (requestId !== ocrRequestId) return
+
+    const amount = Number(data.amount)
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error('OCR 返回了无效金额')
+
+    const canFillAutomatically =
+      !manuallyEditedAtStart && !saleAmountManuallyEdited && saleAmountEditVersion === editVersionAtStart
+    if (canFillAutomatically) {
+      saleAmount.value = amount
+      ocrMessage.value = `已自动识别金额：${formatCurrency(amount)}`
+      ocrMessageType.value = 'success'
+      ElMessage.success('票据金额已自动填入')
+    } else {
+      ocrMessage.value = `识别金额为 ${formatCurrency(amount)}，已保留手动输入的金额`
+      ocrMessageType.value = 'warning'
+    }
+  } catch (error) {
+    if (requestId !== ocrRequestId || error.code === 'ERR_CANCELED') return
+    console.error(error)
+    ocrMessage.value = errorMessage(error, '金额识别失败，请手动输入')
+    ocrMessageType.value = 'error'
+  } finally {
+    if (requestId === ocrRequestId) {
+      recognizing.value = false
+      ocrAbortController = null
+    }
+  }
+}
 
 const waitForImageElement = async (image) => {
   if (typeof image.decode === 'function') {
@@ -593,7 +707,7 @@ const downloadCombined = async () => {
   try {
     const canvas = await renderPreviewCanvas({ targetWidth: 2480 })
     const link = document.createElement('a')
-    link.download = `小票组合_${today}.png`
+    link.download = `票据${formatReceiptTimestamp()}.png`
     link.href = canvas.toDataURL('image/png')
     link.click()
     ElMessage.success('组合图已下载')
@@ -670,6 +784,8 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', resizeChart)
+  ocrRequestId += 1
+  ocrAbortController?.abort()
   releasePrintResource?.()
   chartInstance?.dispose()
 })

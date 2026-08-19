@@ -209,6 +209,48 @@ input {
   gap: 10px;
 }
 
+.ocr-hint {
+  display: flex;
+  align-items: center;
+  min-height: 18px;
+  margin-top: 8px;
+  color: #8b96a8;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.ocr-hint--loading {
+  color: #3370ff;
+}
+
+.ocr-hint--success {
+  color: #12805c;
+}
+
+.ocr-hint--warning {
+  color: #a66a00;
+}
+
+.ocr-hint--error {
+  color: #d14343;
+}
+
+.ocr-spinner {
+  width: 11px;
+  height: 11px;
+  margin-right: 6px;
+  border: 2px solid rgba(51, 112, 255, 0.22);
+  border-top-color: #3370ff;
+  border-radius: 50%;
+  animation: ocr-spin 0.8s linear infinite;
+}
+
+@keyframes ocr-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .amount-input {
   flex: 1;
   width: auto !important;
