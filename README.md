@@ -2,7 +2,7 @@
 
 面向联想门店的本地小票处理工具，用于将商务存根和购物小票组合到一张 A4 纸上进行预览、打印或导出，同时记录每日销售金额并展示今日统计、销售明细和近 30 天趋势。
 
-开发时前后端分离运行；局域网部署时由 Express 在统一的 `8889` 端口同时提供页面和 API。原始图片在浏览器中以 DataURL 形式处理；两张图片齐全后，浏览器会生成一张临时 A4 合成图，经本机 Express 转发至百度文字识别以提取金额。图片和 OCR 原文不会写入 SQLite，销售数据保存在门店电脑的本机 SQLite 文件中。
+开发时前后端分离运行；局域网部署时由 Express 在统一的 `8889` 端口同时提供页面和 API。原始图片在浏览器中以 DataURL 形式处理；两张图片齐全后，浏览器会生成一张临时 A4 合成图，经本机 Express 转发至百度文字识别以提取金额。票据图片不会写入 SQLite；OCR 识别文字、金额、状态、错误和耗时会持久化为可查看的识别记录，销售数据也保存在门店电脑的本机 SQLite 文件中。
 
 ## 功能概览
 
@@ -29,6 +29,15 @@
 - 两张图片上传完成后，应用自动生成目标宽度 `1600px` 的 JPEG 合成图并调用百度文字识别；识别到“实收、应收、合计、总计”等金额后自动填入销售金额输入框。
 - OCR 服务端使用覆盖上传解析、鉴权、识别和 token 失效重试的 35 秒整体期限，浏览器预留 45 秒等待窗口。接受替换图片或清除图片时会立即取消旧任务，后端在客户端断开后同步终止百度 HTTPS 请求。金额输入框只要已有人工编辑，或识别期间发生过任何编辑（即使改回原值），OCR 都只提示结果而不会覆盖手工值。
 - 打印、下载和 OCR 前必须先上传存根、购物小票两张图片。
+
+### OCR 配置与识别记录
+
+- 左侧“百度 OCR 管理”显示当前配置状态，可在页面填写或更新 API Key 与 Secret Key。
+- 保存前后端会向百度验证凭据；验证成功后立即切换新配置，无需重启服务。
+- 页面永不回显 Secret Key，API Key 只显示首尾掩码。凭据使用 AES-256-GCM 加密后存入 SQLite，主密钥来自 `OCR_CONFIG_ENCRYPTION_KEY` 或权限为 `0600` 的 gitignored 本机密钥文件。
+- 环境变量或 `backend/.env` 仍可作为首次启动的后备配置；页面保存的数据库配置优先于环境配置。
+- 每次进入百度识别阶段的成功、失败或取消结果都会持久化，包括金额、命中文本、完整识别文字、错误码、状态和耗时；不保存原始或合成票据图片。
+- 点击金额提示旁的“查看识别结果”，或打开“识别记录”，可以分页查看历史和详情。
 
 ### 销售记录
 
@@ -69,10 +78,13 @@
 ├── CHANGELOG.md               # 按日期记录功能、修复和运维变化
 ├── README.md                  # 项目文档
 ├── backend/
+│   ├── .local/
+│   │   └── ocr-config.key     # 自动生成的本机加密主密钥，不提交到 Git
 │   ├── db/
 │   │   └── database.sqlite    # 运行时自动创建，不提交到 Git
 │   ├── .env.example           # 百度 OCR 环境变量模板，不含真实密钥
 │   ├── baidu-ocr.js           # 百度鉴权、文字识别和金额提取
+│   ├── ocr-storage.js         # 凭据加密、OCR 配置和识别历史持久化
 │   ├── local-env.js           # 加载 gitignored 的本机 .env
 │   ├── package.json
 │   ├── package-lock.json
@@ -89,7 +101,7 @@
     └── vite.config.js         # Vite 配置及 /api 代理
 ```
 
-`node_modules`、前端 `dist`、SQLite 数据库文件和 `backend/.env` 都已加入 `.gitignore`，不会上传到 GitHub。仓库只提交不含真实密钥的 `backend/.env.example`。
+`node_modules`、前端 `dist`、SQLite 数据库文件、`backend/.env` 和 `backend/.local/` 都已加入 `.gitignore`，不会上传到 GitHub。仓库只提交不含真实密钥的 `backend/.env.example`。
 
 ## 更新与发布约定
 
@@ -155,22 +167,26 @@ npm ci
 
 ### 局域网部署模式（推荐）
 
-首次部署前，先按照“安装依赖”章节完成前后端依赖安装，并配置百度 OCR：
+首次部署可以先直接启动应用，然后在页面左侧“百度 OCR 管理”中点击“配置凭据”，填写百度智能云文字识别应用的 API Key 与 Secret Key。后端会先验证凭据，再使用 AES-256-GCM 加密写入本机 SQLite；保存成功后立即生效，无需重启。
+
+也可以在启动前使用环境变量作为后备配置：
 
 ```bash
 cd backend
 cp .env.example .env
 ```
 
-编辑 `backend/.env`，填写百度智能云文字识别应用的凭据：
+编辑 `backend/.env`：
 
 ```dotenv
+# 可选。留空时后端会自动生成 backend/.local/ocr-config.key
+OCR_CONFIG_ENCRYPTION_KEY=
 BAIDU_OCR_API_KEY=your_api_key
 BAIDU_OCR_SECRET_KEY=your_secret_key
 BAIDU_OCR_ENDPOINT=https://aip.baidubce.com/rest/2.0/ocr/v1/general_basic
 ```
 
-也可以通过进程环境变量注入同名配置；环境变量优先于 `.env`。不要使用 `VITE_` 前缀或把凭据写入前端代码，否则密钥会进入浏览器构建产物。门店电脑必须能够通过 HTTPS 访问 `aip.baidubce.com`。
+页面保存的数据库配置优先于环境配置。`OCR_CONFIG_ENCRYPTION_KEY` 可填写 32 字节 Base64 或 64 位十六进制字符串；未填写时系统自动生成 `backend/.local/ocr-config.key` 并设置为仅当前用户可读写。不要使用 `VITE_` 前缀或把凭据写入前端代码，否则密钥会进入浏览器构建产物。门店电脑必须能够通过 HTTPS 访问 `aip.baidubce.com`。
 
 然后在 `backend` 目录执行：
 
@@ -265,7 +281,14 @@ Vite 开发服务监听 `0.0.0.0:5173`，并把 `/api` 请求代理到 `http://1
 
 ## 使用流程
 
-### 1. 上传存根和购物小票
+### 1. 配置百度 OCR 凭据
+
+1. 在左侧“百度 OCR 管理”中点击“配置凭据”。
+2. 首次配置时同时填写 API Key 与 Secret Key；更新时可只填写需要修改的字段，留空字段会保留原值。
+3. 点击“验证并保存”。后端向百度验证成功后加密持久化，并在页面显示掩码状态。
+4. Secret Key 不会返回浏览器；如遗忘只能重新填写覆盖。
+
+### 2. 上传存根和购物小票
 
 1. 在右侧 A4 预览区点击左半区，选择商务存根图片；也可以把图片拖入左半区。
 2. 点击右半区，选择购物小票图片；也可以把图片拖入右半区。
@@ -273,22 +296,29 @@ Vite 开发服务监听 `0.0.0.0:5173`，并把 `/api` 请求代理到 `http://1
 4. 识别成功后，金额自动填入“录入销售金额”输入框；请在保存前核对，必要时可以手动修改。
 5. 如需重新选择，直接点击对应区域并选择另一张图片即可覆盖，系统会取消旧请求并重新识别。
 
-原始图片只保存在当前浏览器页面内；OCR 期间生成的临时合成图会发送到本机 Express，再由 Express 转发至百度文字识别。刷新或关闭页面后，已选图片会被清除；图片、OCR 原文和百度访问令牌均不会写入 SQLite。
+原始图片只保存在当前浏览器页面内；OCR 期间生成的临时合成图会发送到本机 Express，再由 Express 转发至百度文字识别。刷新或关闭页面后，已选图片会被清除。SQLite 会保存百度返回的识别文字、金额匹配、状态、错误和耗时，供“识别记录”查看；不会保存原始图片、合成图片、百度 access token 或明文凭据。
 
-### 2. 记录销售金额
+### 3. 查看识别结果和历史
+
+- 当前识别结束后，点击金额提示右侧的“查看识别结果”可打开对应详情。
+- 点击“百度 OCR 管理”中的“识别记录”可分页查看全部成功、失败和取消记录。
+- 详情包含识别时间、状态、金额、命中文本、文字行数、耗时、错误信息和百度返回的识别文字。
+- 历史记录保存在 `backend/db/database.sqlite`，重启浏览器或后端后仍可查看。
+
+### 4. 记录销售金额
 
 1. 等待图片下方提示显示自动识别结果，或在识别失败时手动输入销售金额。
 2. 核对金额无误后点击“保存记录”，或在输入框内按 Enter。
 3. 后端自动使用门店电脑当前日期写入记录。
 4. 保存成功后，销售列表、今日统计和趋势图会自动刷新。
 
-### 3. 撤销或恢复记录
+### 5. 撤销或恢复记录
 
 - 正常记录右侧显示“撤销”。点击后，该记录仍保留在数据库中，但不再计入今日统计和趋势。
 - 已撤销记录右侧显示“恢复”。点击后会重新计入对应日期的销售统计。
 - 系统采用状态切换而不是物理删除，便于保留操作痕迹。
 
-### 4. 打印 A4
+### 6. 打印 A4
 
 1. 确保存根和购物小票都已上传，并已在 A4 预览中正确显示。
 2. 点击左侧蓝色“打印小票”按钮。请使用应用内按钮，不要使用浏览器菜单中的“打印”或 `Command/Ctrl + P`。
@@ -307,7 +337,7 @@ Vite 开发服务监听 `0.0.0.0:5173`，并把 `/api` 请求代理到 `http://1
 
 不同浏览器和打印机驱动的设置可能不同。若打印尺寸异常，请确认纸张为 A4、方向为纵向、缩放为 100% 或默认，并关闭页眉页脚。物理打印机不支持无边距时，驱动可能对内容进行轻微缩放。
 
-### 5. 下载组合图
+### 7. 下载组合图
 
 1. 确认两张图片均已上传。
 2. 点击“下载组合图”。
@@ -350,7 +380,9 @@ Content-Type: image/jpeg
 {
   "amount": 1280.5,
   "matchedText": "实收金额 1280.50",
-  "wordsCount": 42
+  "wordsCount": 42,
+  "recognizedText": "商品名称\n合计 1280.50",
+  "historyId": 27
 }
 ```
 
@@ -368,7 +400,53 @@ Content-Type: image/jpeg
 | `503` | 后端未配置百度 API Key/Secret Key |
 | `504` | OCR 请求超过服务端 35 秒整体期限；后端同时终止进行中的百度请求 |
 
-接口调用方式参考百度官方的 [Access Token 获取说明](https://ai.baidu.com/ai-doc/REFERENCE/Ck3dwjhhu) 和 [通用文字识别（标准版）文档](https://ai.baidu.com/ai-doc/OCR/zk3h7xz52)。
+接口调用方式参考百度官方的 [Access Token 获取说明](https://ai.baidu.com/ai-doc/REFERENCE/Ck3dwjhhu) 和 [通用文字识别（标准版）文档](https://ai.baidu.com/ai-doc/OCR/zk3h7xz52)。进入百度识别阶段后，无论成功、失败或客户端取消都会写入历史；成功响应和可返回的错误响应包含 `historyId`。
+
+### 查询与更新 OCR 配置
+
+```http
+GET /api/ocr/config
+```
+
+响应只包含配置状态和掩码，不返回 API Key 全文、Secret Key、密文或主密钥：
+
+```json
+{
+  "configured": true,
+  "apiKeyMasked": "abcd••••••wxyz",
+  "hasSecretKey": true,
+  "source": "database",
+  "version": 2,
+  "updatedAt": "2026-08-18 10:30:00",
+  "storageError": false
+}
+```
+
+更新配置：
+
+```http
+PUT /api/ocr/config
+Content-Type: application/json
+```
+
+```json
+{
+  "apiKey": "new_api_key",
+  "secretKey": "new_secret_key",
+  "version": 2
+}
+```
+
+首次配置必须同时提供两个字段；已有配置时，省略或留空的字段会保留原值。后端先向百度验证，再加密保存并原子切换运行时服务。`version` 用于防止并发覆盖，版本冲突返回 `409`。
+
+### 查询 OCR 识别历史
+
+```http
+GET /api/ocr/history?page=1&pageSize=10
+GET /api/ocr/history/:id
+```
+
+列表接口按记录 ID 倒序分页，`pageSize` 范围为 `1` 到 `50`；详情接口返回 `recognizedText`。记录状态为 `success`、`failure` 或 `cancelled`，包含金额、命中文本、文字行数、错误码、HTTP 状态、耗时和 UTC 创建时间。历史不包含票据图片和任何凭据。
 
 ### 新增销售记录
 
@@ -474,7 +552,7 @@ GET /api/sales/trend
 backend/db/database.sqlite
 ```
 
-后端首次启动时会自动创建目录、数据库文件和 `sales` 表，无需手动初始化。
+后端首次启动时会自动创建目录、数据库文件以及 `sales`、`ocr_config`、`ocr_history` 三张表，无需手动初始化。
 
 建表结构：
 
@@ -498,17 +576,20 @@ CREATE TABLE IF NOT EXISTS sales (
 | `status` | INTEGER | `1` 正常，`0` 已撤销 |
 | `created_at` | TEXT | SQLite 自动生成的创建时间 |
 
+`ocr_config` 使用单例行保存 AES-256-GCM 密文、随机 IV、认证标签、乐观锁版本和更新时间；不保存明文凭据。`ocr_history` 保存每次实际百度识别的请求 ID、成功/失败/取消状态、金额、命中文本、识别文字、错误信息、耗时和创建时间，并按时间与 ID 建立倒序索引。
+
 数据库启用了 WAL 日志模式和 5 秒 busy timeout，以提高本地读写稳定性。
 
 ## 数据备份与恢复
 
-数据库文件不会上传到 GitHub，需要门店自行备份。
+数据库文件不会上传到 GitHub，需要门店自行备份。若使用自动生成的本机主密钥，还必须把 `backend/.local/ocr-config.key` 与数据库分别安全备份；只恢复数据库而缺少原密钥时，已加密凭据无法解密，需要在页面重新配置。若使用固定 `OCR_CONFIG_ENCRYPTION_KEY`，应通过密码管理器或部署系统单独备份该环境变量，禁止把它放入 Git。
 
 ### 推荐备份方法
 
 1. 停止后端服务，确保数据库没有正在进行的写入。
 2. 复制 `backend/db/database.sqlite` 到安全位置。
-3. 使用日期命名备份文件，例如：
+3. 如果存在 `backend/.local/ocr-config.key`，将它单独复制到受限位置，不要与公开代码或普通共享文件混放。
+4. 使用日期命名数据库备份文件，例如：
 
 ```text
 database-2026-08-18.sqlite
@@ -519,7 +600,8 @@ database-2026-08-18.sqlite
 1. 停止后端服务。
 2. 将备份文件复制回 `backend/db/`。
 3. 将文件名改为 `database.sqlite`。
-4. 重新启动后端。
+4. 若备份包含 `ocr-config.key`，将它恢复到 `backend/.local/ocr-config.key` 并确保仅运行用户可读写；使用固定环境主密钥时恢复同一个 `OCR_CONFIG_ENCRYPTION_KEY`。
+5. 重新启动后端。
 
 不要在后端运行期间直接覆盖数据库文件。由于项目启用了 WAL 模式，运行时还可能出现 `database.sqlite-wal` 和 `database.sqlite-shm`，这些文件同样不会提交到 Git。
 
@@ -551,11 +633,12 @@ npm run preview
 - 后端默认监听 `0.0.0.0:8889`，允许同一局域网内的设备建立连接。
 - 生产部署由 Express 同源提供页面和 `/api`，浏览器不需要跨域访问。
 - CORS 配置仅允许 `http://localhost:5173` 和 `http://127.0.0.1:5173`，用于本机 Vite 开发场景；Vite 的局域网开发访问通过同源代理请求 API。
-- 原始图片不上传服务器；两图齐全后，浏览器会把临时 A4 合成图发送到本机 Express，再由 Express 通过 HTTPS 转发至百度文字识别。图片、OCR 原文、access token 和密钥都不会写入 SQLite。
-- 百度 API Key/Secret Key 只允许保存在后端进程环境变量或 gitignored 的 `backend/.env`；不得写入 `VITE_` 变量、前端源码、README、CHANGELOG、日志或接口响应。
+- 原始图片不持久化；两图齐全后，浏览器会把临时 A4 合成图发送到本机 Express，再由 Express 通过 HTTPS 转发至百度文字识别。SQLite 会保存识别文字、金额匹配、状态、错误和耗时以供历史查看，但不保存原始/合成图片或百度 access token。
+- 百度 API Key/Secret Key 可以来自后端环境变量、gitignored 的 `backend/.env`，或页面配置。页面配置使用 AES-256-GCM 密文保存，Secret Key 永不回显；不得把凭据写入 `VITE_` 变量、前端源码、README、CHANGELOG、日志或接口响应。
+- 自动生成的加密主密钥位于 gitignored 的 `backend/.local/ocr-config.key` 且权限为 `0600`；生产环境也可使用独立的 `OCR_CONFIG_ENCRYPTION_KEY`。数据库和主密钥必须分开备份，二者都不得提交。
 - OCR 路由限制原图为 6MB、每个 IP 每分钟 10 次、全局最多 2 个并发请求；并发槽位在读取请求体之前以同步方式占用，并在解析错误、断连、成功或失败后幂等释放，以控制百度配额消耗。
 - 浏览器取消识别或连接断开时，后端会将取消信号传递到 token 获取和识别请求；共享 token 刷新仅在所有等待者都取消后才终止，避免浪费配额或影响仍在等待的请求。
-- 项目目前没有用户登录、身份认证和操作权限控制。局域网内能够访问 `8889` 端口的任何设备都可以查看、创建、撤销或恢复销售记录，也可以触发消耗百度 OCR 配额的识别请求。
+- 项目目前没有用户登录、身份认证和操作权限控制。局域网内能够访问 `8889` 端口的任何设备都可以查看销售与 OCR 历史、创建或变更销售记录、替换百度 OCR 凭据，也可以触发消耗百度 OCR 配额的识别请求。
 - 只应部署在受信任的门店内网，不要连接访客 Wi-Fi，也不要在路由器上配置公网端口转发。
 - 不应在未增加 HTTPS、身份认证、权限控制和审计机制的情况下把服务暴露到互联网。
 - macOS 或 Windows 防火墙可能会在首次启动 Node.js 时询问是否允许传入连接；要让局域网设备访问，需要允许 Node.js 接收专用/本地网络连接。
@@ -621,7 +704,8 @@ xcode-select --install
 ### OCR 未自动填入金额
 
 - 确认两张图片都已经显示在 A4 预览中，并查看金额输入框下方的状态提示。
-- 确认 `backend/.env` 已配置 `BAIDU_OCR_API_KEY` 和 `BAIDU_OCR_SECRET_KEY`，修改后需要重启后端。
+- 确认左侧“百度 OCR 管理”显示“已配置”；未配置时点击“配置凭据”并完成验证保存。也可以使用 `backend/.env` 的 `BAIDU_OCR_API_KEY` 和 `BAIDU_OCR_SECRET_KEY` 作为后备配置。
+- 如果页面提示无法解密已保存凭据，恢复原 `backend/.local/ocr-config.key` / `OCR_CONFIG_ENCRYPTION_KEY`，或在页面重新填写凭据覆盖旧配置。
 - 确认门店电脑可以访问 `https://aip.baidubce.com`，并确认百度应用已开通通用文字识别能力且配额未耗尽。
 - OCR 优先匹配“实收、应收、合计、总计”等标签。票据模糊、反光、文字过小或金额没有语义标签时可能无法自动确定，请手动输入。
 - 为避免覆盖人工修正，识别期间修改过金额输入框时，系统只显示识别结果，不会覆盖手工值。

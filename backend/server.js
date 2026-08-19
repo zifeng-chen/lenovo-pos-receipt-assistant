@@ -1,10 +1,12 @@
 const express = require('express')
 const cors = require('cors')
 const Database = require('better-sqlite3')
+const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
 const { loadLocalEnv } = require('./local-env')
 const { createBaiduOcrService } = require('./baidu-ocr')
+const { createOcrStorage } = require('./ocr-storage')
 
 loadLocalEnv(path.join(__dirname, '.env'))
 
@@ -12,13 +14,9 @@ const app = express()
 const port = Number(process.env.PORT) || 8889
 const host = process.env.HOST || '0.0.0.0'
 const databasePath = path.join(__dirname, 'db', 'database.sqlite')
+const ocrKeyFilePath = path.join(__dirname, '.local', 'ocr-config.key')
 const frontendDistPath = path.join(__dirname, '..', 'frontend', 'dist')
 const frontendIndexPath = path.join(frontendDistPath, 'index.html')
-const baiduOcr = createBaiduOcrService({
-  apiKey: process.env.BAIDU_OCR_API_KEY,
-  secretKey: process.env.BAIDU_OCR_SECRET_KEY,
-  endpoint: process.env.BAIDU_OCR_ENDPOINT
-})
 
 fs.mkdirSync(path.dirname(databasePath), { recursive: true })
 
@@ -34,6 +32,41 @@ db.exec(`
     created_at TEXT DEFAULT (datetime('now'))
   )
 `)
+
+const ocrStorage = createOcrStorage({
+  db,
+  keyFilePath: ocrKeyFilePath,
+  environmentKey: process.env.OCR_CONFIG_ENCRYPTION_KEY
+})
+const environmentOcrCredentials =
+  process.env.BAIDU_OCR_API_KEY && process.env.BAIDU_OCR_SECRET_KEY
+    ? { apiKey: process.env.BAIDU_OCR_API_KEY, secretKey: process.env.BAIDU_OCR_SECRET_KEY }
+    : null
+let currentOcrCredentials = null
+let ocrCredentialSource = 'none'
+let ocrCredentialStorageError = false
+
+try {
+  currentOcrCredentials = ocrStorage.loadCredentials()
+  if (currentOcrCredentials) ocrCredentialSource = 'database'
+} catch (error) {
+  ocrCredentialStorageError = true
+  console.error(`OCR 凭据存储错误 [${error.code || 'UNKNOWN'}]，请在页面重新配置`)
+}
+
+if (!currentOcrCredentials && environmentOcrCredentials) {
+  currentOcrCredentials = environmentOcrCredentials
+  ocrCredentialSource = 'environment'
+}
+
+const createCurrentOcrService = (credentials = currentOcrCredentials) =>
+  createBaiduOcrService({
+    apiKey: credentials?.apiKey,
+    secretKey: credentials?.secretKey,
+    endpoint: process.env.BAIDU_OCR_ENDPOINT
+  })
+
+let baiduOcr = createCurrentOcrService()
 
 app.use(
   cors({
@@ -62,6 +95,69 @@ function createOcrRequestError(status, message, code) {
   error.status = status
   error.code = code
   return error
+}
+
+function getOcrConfigStatus() {
+  return ocrStorage.getConfigStatus(currentOcrCredentials, ocrCredentialSource, ocrCredentialStorageError)
+}
+
+app.get('/api/ocr/config', (req, res) => {
+  return res.json(getOcrConfigStatus())
+})
+
+app.put('/api/ocr/config', async (req, res, next) => {
+  const apiKeyInput = typeof req.body?.apiKey === 'string' ? req.body.apiKey.trim() : ''
+  const secretKeyInput = typeof req.body?.secretKey === 'string' ? req.body.secretKey.trim() : ''
+  const expectedVersion = Number(req.body?.version)
+
+  if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+    return res.status(400).json({ message: 'OCR 配置版本无效，请刷新后重试' })
+  }
+  if (expectedVersion !== getOcrConfigStatus().version) {
+    return res.status(409).json({ message: 'OCR 配置已被其他操作更新，请刷新后重试' })
+  }
+  if (!apiKeyInput && !secretKeyInput) {
+    return res.status(400).json({ message: '请至少填写 API Key 或 Secret Key' })
+  }
+
+  const apiKey = apiKeyInput || currentOcrCredentials?.apiKey
+  const secretKey = secretKeyInput || currentOcrCredentials?.secretKey
+  if (!apiKey || !secretKey) {
+    return res.status(400).json({ message: '首次配置必须同时填写 API Key 和 Secret Key' })
+  }
+  if (apiKey.length > 512 || secretKey.length > 512) {
+    return res.status(400).json({ message: 'API Key 或 Secret Key 长度无效' })
+  }
+
+  const nextCredentials = { apiKey, secretKey }
+  const nextService = createCurrentOcrService(nextCredentials)
+  const controller = new AbortController()
+  const validationTimeout = setTimeout(() => {
+    controller.abort(createOcrRequestError(504, '百度 OCR 凭据验证超时', 'OCR_CONFIG_VALIDATION_TIMEOUT'))
+  }, 20000)
+
+  try {
+    await nextService.validateCredentials({ signal: controller.signal })
+    const saved = ocrStorage.saveCredentials({ apiKey, secretKey, expectedVersion })
+    currentOcrCredentials = { apiKey: saved.apiKey, secretKey: saved.secretKey }
+    ocrCredentialSource = 'database'
+    ocrCredentialStorageError = false
+    baiduOcr = nextService
+    return res.json(getOcrConfigStatus())
+  } catch (error) {
+    return next(error)
+  } finally {
+    clearTimeout(validationTimeout)
+  }
+})
+
+function persistOcrHistory(entry) {
+  return ocrStorage.insertHistory(entry)
+}
+
+function createHistoryPersistenceError() {
+  console.error('OCR 历史记录写入失败 [DATABASE_ERROR]')
+  return createOcrRequestError(500, 'OCR 结果持久化失败，请稍后重试', 'OCR_HISTORY_PERSIST_FAILED')
 }
 
 function ocrRateLimit(req, res, next) {
@@ -209,17 +305,73 @@ app.post(
     }
 
     const ocrRequest = res.locals.ocrRequest
+    const requestId = crypto.randomUUID()
+    const startedAt = Date.now()
     ocrRequest.startProcessing()
     try {
-      const result = await baiduOcr.recognizeAmount(req.body, { signal: ocrRequest.signal })
-      return res.json(result)
-    } catch (error) {
-      return next(error)
+      let result
+      try {
+        result = await baiduOcr.recognizeAmount(req.body, { signal: ocrRequest.signal })
+      } catch (ocrError) {
+        let historyId
+        try {
+          historyId = persistOcrHistory({
+            requestId,
+            status: Number(ocrError.status) === 499 ? 'cancelled' : 'failure',
+            wordsCount: ocrError.ocrDetails?.wordsCount,
+            recognizedText: ocrError.ocrDetails?.recognizedText,
+            errorCode: ocrError.code,
+            httpStatus: Number(ocrError.status) || 500,
+            errorMessage: ocrError.message,
+            durationMs: Date.now() - startedAt
+          })
+        } catch (historyError) {
+          return next(createHistoryPersistenceError())
+        }
+        ocrError.historyId = historyId
+        return next(ocrError)
+      }
+
+      let historyId
+      try {
+        historyId = persistOcrHistory({
+          requestId,
+          status: 'success',
+          amount: result.amount,
+          matchedText: result.matchedText,
+          wordsCount: result.wordsCount,
+          recognizedText: result.recognizedText,
+          httpStatus: 200,
+          durationMs: Date.now() - startedAt
+        })
+      } catch (historyError) {
+        return next(createHistoryPersistenceError())
+      }
+      return res.json({ ...result, historyId })
     } finally {
       ocrRequest.release()
     }
   }
 )
+
+app.get('/api/ocr/history', (req, res) => {
+  const page = req.query.page === undefined ? 1 : Number(req.query.page)
+  const pageSize = req.query.pageSize === undefined ? 10 : Number(req.query.pageSize)
+  if (!Number.isInteger(page) || page < 1 || !Number.isInteger(pageSize) || pageSize < 1 || pageSize > 50) {
+    return res.status(400).json({ message: 'page 必须大于 0，pageSize 必须在 1 到 50 之间' })
+  }
+  return res.json(ocrStorage.listHistory({ page, pageSize }))
+})
+
+app.get('/api/ocr/history/:id', (req, res) => {
+  const id = Number(req.params.id)
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ message: '无效的 OCR 记录 ID' })
+  }
+  const history = ocrStorage.getHistoryById(id)
+  if (!history) return res.status(404).json({ message: 'OCR 识别记录不存在' })
+  return res.json(history)
+})
 
 app.post('/api/sales', (req, res) => {
   const amount = Number(req.body?.amount)
@@ -325,7 +477,10 @@ app.use((error, req, res, next) => {
   const status = Number(error.status)
   if (Number.isInteger(status) && status >= 400 && status < 600) {
     if (status >= 500) console.error(`OCR/API 错误 [${error.code || status}]：${error.message}`)
-    return res.status(status).json({ message: error.message })
+    const response = { message: error.message }
+    if (error.code) response.code = error.code
+    if (error.historyId) response.historyId = error.historyId
+    return res.status(status).json(response)
   }
 
   console.error(error)

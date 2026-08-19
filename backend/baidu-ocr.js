@@ -319,19 +319,31 @@ function createBaiduOcrService({ apiKey, secretKey, endpoint = DEFAULT_OCR_ENDPO
     }
 
     const words = Array.isArray(data.words_result) ? data.words_result.map((item) => item.words).filter(Boolean) : []
+    const recognizedText = words.join('\n').slice(0, 100000)
     const result = extractReceiptAmount(words)
     if (!result) {
-      throw createHttpError(422, '未识别到明确的票据金额，请手动输入', 'AMOUNT_NOT_FOUND')
+      const error = createHttpError(422, '未识别到明确的票据金额，请手动输入', 'AMOUNT_NOT_FOUND')
+      error.ocrDetails = {
+        wordsCount: words.length,
+        recognizedText
+      }
+      throw error
     }
 
     return {
       amount: result.value,
       matchedText: result.matchedText,
-      wordsCount: words.length
+      wordsCount: words.length,
+      recognizedText
     }
   }
 
-  return { recognizeAmount }
+  async function validateCredentials({ signal } = {}) {
+    await getAccessToken(false, signal)
+    return true
+  }
+
+  return { recognizeAmount, validateCredentials }
 }
 
 module.exports = {

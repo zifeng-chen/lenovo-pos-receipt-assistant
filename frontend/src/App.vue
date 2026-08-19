@@ -54,7 +54,16 @@
         </div>
         <div :class="['ocr-hint', `ocr-hint--${ocrMessageType}`]" aria-live="polite">
           <span v-if="recognizing" class="ocr-spinner" aria-hidden="true"></span>
-          {{ ocrMessage }}
+          <span>{{ ocrMessage }}</span>
+          <el-button
+            v-if="currentOcrHistoryId"
+            link
+            type="primary"
+            class="ocr-result-link"
+            @click="openHistoryDetail(currentOcrHistoryId)"
+          >
+            查看识别结果
+          </el-button>
         </div>
       </section>
 
@@ -68,6 +77,28 @@
         <el-button class="action-button action-button--download" :loading="downloading" @click="downloadCombined">
           <span class="button-icon">↓</span> 下载组合图
         </el-button>
+      </section>
+
+      <section class="panel-section ocr-management-section">
+        <div class="section-heading section-heading--compact">
+          <div>
+            <span class="section-eyebrow section-eyebrow--dark">文字识别</span>
+            <h2>百度 OCR 管理</h2>
+          </div>
+          <span :class="['ocr-config-state', { 'is-ready': ocrConfig.configured }]">
+            {{ ocrConfig.configured ? '已配置' : '未配置' }}
+          </span>
+        </div>
+        <p class="ocr-config-summary">
+          <template v-if="ocrConfig.configured">
+            API Key：{{ ocrConfig.apiKeyMasked }} · {{ ocrConfigSourceLabel }}
+          </template>
+          <template v-else>请先配置百度智能云文字识别应用凭据</template>
+        </p>
+        <div class="ocr-management-actions">
+          <el-button plain @click="openOcrConfigDialog">配置凭据</el-button>
+          <el-button plain @click="openOcrHistoryDialog">识别记录</el-button>
+        </div>
       </section>
 
       <section class="panel-section records-section">
@@ -183,11 +214,144 @@
       <input ref="stubInputRef" type="file" accept="image/*" hidden @change="handleFileSelect('stub', $event)" />
       <input ref="receiptInputRef" type="file" accept="image/*" hidden @change="handleFileSelect('receipt', $event)" />
     </section>
+
+    <el-dialog
+      v-model="configDialogVisible"
+      title="配置百度智能云文字识别"
+      width="min(500px, 92vw)"
+      append-to-body
+      :close-on-click-modal="!configSaving"
+      :close-on-press-escape="!configSaving"
+      :show-close="!configSaving"
+      @close="resetOcrConfigForm"
+    >
+      <div class="ocr-config-dialog-summary">
+        <span :class="['ocr-config-state', { 'is-ready': ocrConfig.configured }]">
+          {{ ocrConfig.configured ? '当前已配置' : '当前未配置' }}
+        </span>
+        <span v-if="ocrConfig.configured">{{ ocrConfig.apiKeyMasked }}</span>
+      </div>
+      <el-alert
+        title="凭据仅发送到当前门店后端，Secret Key 不会回显；留空字段将保留现有值。"
+        type="info"
+        :closable="false"
+        show-icon
+      />
+      <el-form label-position="top" class="ocr-config-form" @submit.prevent>
+        <el-form-item label="API Key">
+          <el-input
+            v-model="ocrConfigForm.apiKey"
+            autocomplete="off"
+            :placeholder="ocrConfig.configured ? '留空以保留当前 API Key' : '请输入 API Key'"
+          />
+        </el-form-item>
+        <el-form-item label="Secret Key">
+          <el-input
+            v-model="ocrConfigForm.secretKey"
+            type="password"
+            show-password
+            autocomplete="new-password"
+            :placeholder="ocrConfig.hasSecretKey ? '留空以保留当前 Secret Key' : '请输入 Secret Key'"
+          />
+        </el-form-item>
+      </el-form>
+      <p class="ocr-config-security-note">
+        保存前会向百度验证凭据；数据库仅保存 AES-256-GCM 密文。此系统无登录功能，只能部署在可信门店内网。
+      </p>
+      <template #footer>
+        <el-button :disabled="configSaving" @click="closeOcrConfigDialog">取消</el-button>
+        <el-button type="primary" :loading="configSaving" @click="saveOcrConfig">验证并保存</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="historyDialogVisible"
+      title="OCR 识别记录"
+      width="min(860px, 94vw)"
+      append-to-body
+      @close="cancelHistoryRequests"
+    >
+      <el-table
+        v-loading="historyLoading"
+        :data="ocrHistory.items"
+        height="420"
+        class="ocr-history-table"
+        empty-text="暂无识别记录"
+        row-key="id"
+        @row-click="handleHistoryRowClick"
+      >
+        <el-table-column label="时间" min-width="155">
+          <template #default="scope">{{ formatHistoryTime(scope.row.createdAt) }}</template>
+        </el-table-column>
+        <el-table-column label="状态" width="84">
+          <template #default="scope">
+            <span :class="['history-status', `history-status--${scope.row.status}`]">
+              {{ historyStatusLabel(scope.row.status) }}
+            </span>
+          </template>
+        </el-table-column>
+        <el-table-column label="金额" width="110">
+          <template #default="scope">{{ scope.row.amount ? formatCurrency(scope.row.amount) : '—' }}</template>
+        </el-table-column>
+        <el-table-column prop="matchedText" label="命中文本" min-width="180" show-overflow-tooltip />
+        <el-table-column label="耗时" width="86">
+          <template #default="scope">{{ scope.row.durationMs }}ms</template>
+        </el-table-column>
+        <el-table-column label="操作" width="70" align="right">
+          <template #default="scope">
+            <el-button link type="primary" @click.stop="openHistoryDetail(scope.row.id)">查看</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <div class="ocr-history-pagination">
+        <el-pagination
+          background
+          layout="total, prev, pager, next"
+          :total="ocrHistory.total"
+          :page-size="ocrHistory.pageSize"
+          :current-page="ocrHistory.page"
+          @current-change="changeHistoryPage"
+        />
+      </div>
+    </el-dialog>
+
+    <el-dialog
+      v-model="detailDialogVisible"
+      title="识别结果详情"
+      width="min(680px, 94vw)"
+      append-to-body
+      @close="cancelHistoryDetail"
+    >
+      <div v-loading="detailLoading" class="ocr-detail">
+        <template v-if="selectedHistory">
+          <div class="ocr-detail-grid">
+            <div><span>记录编号</span><strong>#{{ selectedHistory.id }}</strong></div>
+            <div><span>识别时间</span><strong>{{ formatHistoryTime(selectedHistory.createdAt) }}</strong></div>
+            <div><span>状态</span><strong>{{ historyStatusLabel(selectedHistory.status) }}</strong></div>
+            <div><span>耗时</span><strong>{{ selectedHistory.durationMs }}ms</strong></div>
+            <div><span>识别金额</span><strong>{{ selectedHistory.amount ? formatCurrency(selectedHistory.amount) : '—' }}</strong></div>
+            <div><span>文字行数</span><strong>{{ selectedHistory.wordsCount }}</strong></div>
+          </div>
+          <div v-if="selectedHistory.matchedText" class="ocr-detail-block">
+            <span>金额命中文本</span>
+            <p>{{ selectedHistory.matchedText }}</p>
+          </div>
+          <div v-if="selectedHistory.errorMessage" class="ocr-detail-block ocr-detail-block--error">
+            <span>失败原因（{{ selectedHistory.errorCode || selectedHistory.httpStatus }}）</span>
+            <p>{{ selectedHistory.errorMessage }}</p>
+          </div>
+          <div class="ocr-detail-block">
+            <span>百度 OCR 识别文字</span>
+            <pre>{{ selectedHistory.recognizedText || '未返回可保存的识别文字' }}</pre>
+          </div>
+        </template>
+      </div>
+    </el-dialog>
   </main>
 </template>
 
 <script setup>
-import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import * as echarts from 'echarts'
 import html2canvas from 'html2canvas'
@@ -209,12 +373,40 @@ const downloading = ref(false)
 const recognizing = ref(false)
 const ocrMessage = ref('上传两张图片后自动识别销售金额')
 const ocrMessageType = ref('neutral')
+const currentOcrHistoryId = ref(null)
+const ocrConfig = ref({
+  configured: false,
+  apiKeyMasked: '',
+  hasSecretKey: false,
+  source: 'none',
+  version: 0,
+  updatedAt: null,
+  storageError: false
+})
+const configDialogVisible = ref(false)
+const configSaving = ref(false)
+const ocrConfigForm = ref({ apiKey: '', secretKey: '' })
+const historyDialogVisible = ref(false)
+const historyLoading = ref(false)
+const ocrHistory = ref({ items: [], total: 0, page: 1, pageSize: 10, totalPages: 1 })
+const detailDialogVisible = ref(false)
+const detailLoading = ref(false)
+const selectedHistory = ref(null)
+const ocrConfigSourceLabel = computed(() => {
+  if (ocrConfig.value.source === 'database') return '页面持久化配置'
+  if (ocrConfig.value.source === 'environment') return '后端环境配置'
+  return '未配置'
+})
 let chartInstance = null
 let releasePrintResource = null
 let ocrAbortController = null
 let ocrRequestId = 0
 let saleAmountEditVersion = 0
 let saleAmountManuallyEdited = false
+let historyRequestId = 0
+let historyAbortController = null
+let detailRequestId = 0
+let detailAbortController = null
 const imageReadVersions = { stub: 0, receipt: 0 }
 
 const markSaleAmountEdited = () => {
@@ -227,6 +419,7 @@ const cancelActiveOcr = () => {
   ocrAbortController?.abort()
   ocrAbortController = null
   recognizing.value = false
+  currentOcrHistoryId.value = null
 }
 
 const formatReceiptTimestamp = (date = new Date()) => {
@@ -255,6 +448,175 @@ const formatCurrency = (value) =>
   }).format(Number(value) || 0)
 
 const errorMessage = (error, fallback) => error.response?.data?.message || fallback
+
+const formatHistoryTime = (value) => {
+  if (!value) return '—'
+  const date = new Date(`${String(value).replace(' ', 'T')}Z`)
+  if (Number.isNaN(date.getTime())) return value
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  }).format(date)
+}
+
+const historyStatusLabel = (status) => {
+  if (status === 'success') return '成功'
+  if (status === 'cancelled') return '已取消'
+  return '失败'
+}
+
+const fetchOcrConfig = async () => {
+  const { data } = await api.get('/ocr/config')
+  ocrConfig.value = data
+  return data
+}
+
+const resetOcrConfigForm = () => {
+  ocrConfigForm.value = { apiKey: '', secretKey: '' }
+}
+
+const closeOcrConfigDialog = () => {
+  resetOcrConfigForm()
+  configDialogVisible.value = false
+}
+
+const openOcrConfigDialog = async () => {
+  try {
+    await fetchOcrConfig()
+    resetOcrConfigForm()
+    configDialogVisible.value = true
+  } catch (error) {
+    ElMessage.error(errorMessage(error, 'OCR 配置状态加载失败'))
+  }
+}
+
+const saveOcrConfig = async () => {
+  const apiKey = ocrConfigForm.value.apiKey.trim()
+  const secretKey = ocrConfigForm.value.secretKey.trim()
+  if (!apiKey && !secretKey) {
+    ElMessage.warning('请至少填写 API Key 或 Secret Key')
+    return
+  }
+
+  configSaving.value = true
+  try {
+    const { data } = await api.put(
+      '/ocr/config',
+      {
+        apiKey: apiKey || undefined,
+        secretKey: secretKey || undefined,
+        version: ocrConfig.value.version
+      },
+      { timeout: 30000 }
+    )
+    ocrConfig.value = data
+    resetOcrConfigForm()
+    configDialogVisible.value = false
+    ElMessage.success('百度 OCR 凭据已验证并加密保存')
+  } catch (error) {
+    if (error.response?.status === 409) {
+      try {
+        await fetchOcrConfig()
+      } catch (refreshError) {
+        console.error(refreshError)
+      }
+    }
+    ElMessage.error(errorMessage(error, '百度 OCR 凭据保存失败'))
+  } finally {
+    configSaving.value = false
+  }
+}
+
+const cancelHistoryRequests = () => {
+  historyRequestId += 1
+  historyAbortController?.abort()
+  historyAbortController = null
+  historyLoading.value = false
+}
+
+const fetchOcrHistory = async (page = ocrHistory.value.page) => {
+  const requestId = ++historyRequestId
+  historyAbortController?.abort()
+  const controller = new AbortController()
+  historyAbortController = controller
+  historyLoading.value = true
+  try {
+    const { data } = await api.get('/ocr/history', {
+      params: { page, pageSize: ocrHistory.value.pageSize },
+      signal: controller.signal
+    })
+    if (requestId !== historyRequestId) return false
+    ocrHistory.value = data
+    return true
+  } catch (error) {
+    if (requestId !== historyRequestId || error.code === 'ERR_CANCELED') return false
+    throw error
+  } finally {
+    if (requestId === historyRequestId) {
+      historyLoading.value = false
+      historyAbortController = null
+    }
+  }
+}
+
+const openOcrHistoryDialog = async () => {
+  historyDialogVisible.value = true
+  ocrHistory.value = { ...ocrHistory.value, page: 1 }
+  try {
+    await fetchOcrHistory(1)
+  } catch (error) {
+    ElMessage.error(errorMessage(error, 'OCR 识别记录加载失败'))
+  }
+}
+
+const changeHistoryPage = async (page) => {
+  ocrHistory.value = { ...ocrHistory.value, page }
+  try {
+    await fetchOcrHistory(page)
+  } catch (error) {
+    ElMessage.error(errorMessage(error, 'OCR 识别记录加载失败'))
+  }
+}
+
+const cancelHistoryDetail = () => {
+  detailRequestId += 1
+  detailAbortController?.abort()
+  detailAbortController = null
+  detailLoading.value = false
+  selectedHistory.value = null
+}
+
+const openHistoryDetail = async (id) => {
+  if (!id) return
+  const requestId = ++detailRequestId
+  detailAbortController?.abort()
+  const controller = new AbortController()
+  detailAbortController = controller
+  detailDialogVisible.value = true
+  detailLoading.value = true
+  selectedHistory.value = null
+  try {
+    const { data } = await api.get(`/ocr/history/${id}`, { signal: controller.signal })
+    if (requestId !== detailRequestId) return
+    selectedHistory.value = data
+  } catch (error) {
+    if (requestId !== detailRequestId || error.code === 'ERR_CANCELED') return
+    detailDialogVisible.value = false
+    ElMessage.error(errorMessage(error, '识别结果详情加载失败'))
+  } finally {
+    if (requestId === detailRequestId) {
+      detailLoading.value = false
+      detailAbortController = null
+    }
+  }
+}
+
+const handleHistoryRowClick = (row) => openHistoryDetail(row.id)
 
 const fetchSales = async () => {
   const { data } = await api.get('/sales')
@@ -567,6 +929,7 @@ const recognizeAmountAutomatically = async () => {
 
     const amount = Number(data.amount)
     if (!Number.isFinite(amount) || amount <= 0) throw new Error('OCR 返回了无效金额')
+    currentOcrHistoryId.value = data.historyId || null
 
     const canFillAutomatically =
       !manuallyEditedAtStart && !saleAmountManuallyEdited && saleAmountEditVersion === editVersionAtStart
@@ -581,6 +944,7 @@ const recognizeAmountAutomatically = async () => {
     }
   } catch (error) {
     if (requestId !== ocrRequestId || error.code === 'ERR_CANCELED') return
+    currentOcrHistoryId.value = error.response?.data?.historyId || null
     console.error(error)
     ocrMessage.value = errorMessage(error, '金额识别失败，请手动输入')
     ocrMessageType.value = 'error'
@@ -588,6 +952,9 @@ const recognizeAmountAutomatically = async () => {
     if (requestId === ocrRequestId) {
       recognizing.value = false
       ocrAbortController = null
+      if (historyDialogVisible.value && currentOcrHistoryId.value) {
+        void fetchOcrHistory(ocrHistory.value.page).catch((error) => console.error(error))
+      }
     }
   }
 }
@@ -773,19 +1140,23 @@ onMounted(async () => {
   updateChart()
   window.addEventListener('resize', resizeChart)
   loading.value = true
-  try {
-    await refreshDashboard()
-  } catch (error) {
-    ElMessage.error(errorMessage(error, '数据加载失败，请确认后端服务已启动'))
-  } finally {
-    loading.value = false
+  const [dashboardResult, configResult] = await Promise.allSettled([refreshDashboard(), fetchOcrConfig()])
+  if (dashboardResult.status === 'rejected') {
+    ElMessage.error(errorMessage(dashboardResult.reason, '数据加载失败，请确认后端服务已启动'))
   }
+  if (configResult.status === 'rejected') {
+    ElMessage.warning(errorMessage(configResult.reason, 'OCR 配置状态加载失败'))
+  }
+  loading.value = false
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', resizeChart)
   ocrRequestId += 1
   ocrAbortController?.abort()
+  cancelHistoryRequests()
+  cancelHistoryDetail()
+  resetOcrConfigForm()
   releasePrintResource?.()
   chartInstance?.dispose()
 })
